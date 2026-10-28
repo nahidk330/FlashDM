@@ -1,125 +1,82 @@
 package com.flash.dm
 
+import android.os.Bundle
+import android.os.Environment
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.File
-import java.io.IOException
-import java.io.RandomAccessFile
-import java.util.concurrent.atomic.AtomicLongArray
 
-enum class Status { QUEUED, RUNNING, PAUSED, DONE, FAILED }
+class MainActivity : ComponentActivity() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val client = OkHttpClient()
 
-data class DownloadState(
-    val fileName: String,
-    val total: Long = -1,
-    val downloaded: Long = 0,
-    val speedBps: Long = 0,
-    val status: Status = Status.QUEUED
-)
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { MaterialTheme { FlashApp() } }
+    }
 
-class DownloadTask(
-    val url: String,
-    private val dest: File,
-    private val client: OkHttpClient,
-    private val scope: CoroutineScope,
-    private val maxConnections: Int = 4
-) {
-    private val _state = MutableStateFlow(DownloadState(dest.name))
-    val state: StateFlow<DownloadState> = _state
+    @Composable
+    fun FlashApp() {
+        var url by remember { mutableStateOf("") }
+        val tasks = remember { mutableStateListOf<DownloadTask>() }
+        val clipboard = LocalClipboardManager.current
 
-    private var job: Job? = null
-    private var resumable = false
-    private var segStart = LongArray(0)
-    private var segEnd = LongArray(0)
-    private var segDone = AtomicLongArray(0)
+        LaunchedEffect(Unit) {
+            val t = clipboard.getText()?.text?.trim()
+            if (t != null && t.startsWith("http")) url = t
+        }
 
-    fun start() {
-        if (job?.isActive == true) return
-        job = scope.launch(Dispatchers.IO) {
-            try {
-                _state.update { it.copy(status = Status.RUNNING) }
-                if (segStart.isEmpty()) probe()
-                if (!resumable) for (i in 0 until segDone.length()) segDone.set(i, 0)
-                coroutineScope {
-                    val ticker = launch { trackSpeed() }
-                    segStart.indices.map { i -> launch { downloadSegment(i) } }.joinAll()
-                    ticker.cancel()
+        Column(Modifier.fillMaxSize().padding(16.dp)) {
+            Text("⚡ Flash Download Manager", style = MaterialTheme.typography.headlineSmall)
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = url, onValueChange = { url = it },
+                label = { Text("ডাউনলোড লিংক") }, modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = {
+                if (url.startsWith("http")) {
+                    val name = url.substringAfterLast('/').substringBefore('?').ifBlank { "file" }
+                    val dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)!!
+                    val task = DownloadTask(url, File(dir, name), client, scope)
+                    tasks.add(0, task); task.start(); url = ""
                 }
-                _state.update { it.copy(status = Status.DONE, speedBps = 0, downloaded = sumDone()) }
-            } catch (e: CancellationException) {
-                _state.update { it.copy(status = Status.PAUSED, speedBps = 0) }
-                throw e
-            } catch (e: Exception) {
-                _state.update { it.copy(status = Status.FAILED, speedBps = 0) }
-            }
+            }) { Text("ডাউনলোড শুরু") }
+            LazyColumn { items(tasks) { TaskRow(it) } }
         }
     }
 
-    fun pause() { job?.cancel() }
-
-    private fun probe() {
-        val req = Request.Builder().url(url).header("Range", "bytes=0-0").build()
-        client.newCall(req).execute().use { r ->
-            if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
-            resumable = r.code == 206
-            val total = if (resumable)
-                r.header("Content-Range")?.substringAfter('/')?.toLongOrNull() ?: -1L
-            else r.header("Content-Length")?.toLongOrNull() ?: -1L
-
-            val n = if (resumable && total > 0) maxConnections else 1
-            val chunk = if (total > 0) total / n else 0L
-            segStart = LongArray(n) { it * chunk }
-            segEnd = LongArray(n) { if (total <= 0) -1L else if (it == n - 1) total - 1 else (it + 1) * chunk - 1 }
-            segDone = AtomicLongArray(n)
-            if (total > 0) RandomAccessFile(dest, "rw").use { it.setLength(total) }
-            _state.update { it.copy(total = total) }
-        }
-    }
-
-    private suspend fun downloadSegment(i: Int) {
-        val start = segStart[i] + segDone.get(i)
-        val end = segEnd[i]
-        if (end >= 0 && start > end) return
-
-        val rb = Request.Builder().url(url)
-        if (resumable) rb.header("Range", "bytes=$start-$end")
-        val call = client.newCall(rb.build())
-        val handle = currentCoroutineContext().job.invokeOnCompletion { call.cancel() }
-        try {
-            call.execute().use { r ->
-                if (!r.isSuccessful) throw IOException("HTTP ${r.code}")
-                val src = r.body?.byteStream() ?: throw IOException("Empty body")
-                RandomAccessFile(dest, "rw").use { raf ->
-                    raf.seek(start)
-                    val buf = ByteArray(32 * 1024)
-                    while (true) {
-                        currentCoroutineContext().ensureActive()
-                        val n = src.read(buf)
-                        if (n < 0) break
-                        raf.write(buf, 0, n)
-                        segDone.addAndGet(i, n.toLong())
-                    }
+    @Composable
+    fun TaskRow(t: DownloadTask) {
+        val s by t.state.collectAsState()
+        Card(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+            Column(Modifier.padding(12.dp)) {
+                Text(s.fileName)
+                val p = if (s.total > 0) s.downloaded.toFloat() / s.total else 0f
+                LinearProgressIndicator(progress = { p }, modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp))
+                Text("${fmt(s.speedBps)}/s  •  ${(p * 100).toInt()}%  •  ${s.status}")
+                when (s.status) {
+                    Status.RUNNING -> TextButton(onClick = { t.pause() }) { Text("⏸ Pause") }
+                    Status.PAUSED, Status.FAILED -> TextButton(onClick = { t.start() }) { Text("▶ Resume") }
+                    else -> {}
                 }
             }
-        } catch (e: IOException) {
-            if (!currentCoroutineContext().isActive) throw CancellationException("paused")
-            throw e
-        } finally {
-            handle.dispose()
         }
     }
 
-    private fun sumDone(): Long = (0 until segDone.length()).sumOf { segDone.get(it) }
-
-    private suspend fun trackSpeed() {
-        var last = sumDone()
-        while (true) {
-            delay(500)
-            val now = sumDone()
-            _state.update { it.copy(downloaded = now, speedBps = (now - last) * 2) }
-            last = now
-        }
+    private fun fmt(b: Long): String = when {
+        b > 1_000_000 -> "%.1f MB".format(b / 1_000_000.0)
+        b > 1_000 -> "%.0f KB".format(b / 1_000.0)
+        else -> "$b B"
     }
 }
